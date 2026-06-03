@@ -1,1 +1,1 @@
-# Mini-LLaVA-from-scratch
+# LLaVA-from-scratch
