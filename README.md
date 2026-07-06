@@ -43,7 +43,7 @@
 
 ## **2. Описание решения**
 
-Проект разбит на два этапа — сначала учим «склейку» vision + language, потом добавляем spatial grounding.
+Проект разбит на два этапа — сначала учим «склейку» vision + language (LLaVA: Visual Instruction Tuning), потом добавляем spatial grounding (DETR + LISA).
 
 ### **Этап 1: LLaVA adapter** (`LLaVA_adapter_train.ipynb`)
 
@@ -52,9 +52,9 @@
 - Лосс считается **только** по токенам ответа (`labels[:len(prompt)] = -100`)
 - MLP с `pixel_unshuffle` — сжимаем число visual tokens в 4 раза перед проекцией
 
-### **Этап 2: LIZA grounding** (`LIZA_grounding_train.ipynb`)
+### **Этап 2: LIDA grounding** (`LIDA_grounding_train.ipynb`)
 
-Название LIZA — моя версия LISA: та же идея «спецтокен → hidden state → spatial output», но вместо segmentation mask пока bbox.
+Название LIDA — моя версия LISA: та же идея «спецтокен → hidden state → spatial output», но вместо segmentation mask - bbox.
 
 Из COCO 2017 собираем 4 типа сэмплов:
 
@@ -80,8 +80,8 @@ total_loss = text_loss + detection_loss
 Mini-LLaVA-from-scratch/
 ├── LLaVA_adapter_train.ipynb    # Этап 1: MLP на COCO captions
 ├── LLaVA_inference.ipynb        # Captioning + сравнение с baseline
-├── LIZA_grounding_train.ipynb   # Этап 2: grounding + LoRA + detection head
-├── LIZA_inference.ipynb         # Describe / locate / joint
+├── LIDA_grounding_train.ipynb   # Этап 2: grounding + LoRA + detection head
+├── LIDA_inference.ipynb         # Describe / locate / joint
 └── models/model0/checkpoints/   # Веса (adapter, head, LoRA, loss log)
 ```
 
@@ -100,7 +100,7 @@ Mini-LLaVA-from-scratch/
 - **Learning rate:** 1e-3 (AdamW, weight_decay=0.1)
 - **Precision:** fp16
 
-### **Этап 2 — LIZA grounding**
+### **Этап 2 — LIDA grounding**
 
 **Гиперпараметры**
 - **Dataset:** COCO 2017 (captions + instances)
