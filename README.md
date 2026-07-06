@@ -1,257 +1,162 @@
-# Mini-LLaVA → LIZA
+# Mini-LLaVA-from-scratch
 
-Я собрал в одном репозитории три идеи из разных статей и попробовал склеить их в одну модель, которая умеет **описывать картинки** и **находить объекты по текстовому запросу**. Без готовых LLaVA-обёрток от HuggingFace — всё на чистом PyTorch, в Jupyter-ноутбуках.
+Оригинальные статьи:
+- [LLaVA: Visual Instruction Tuning](https://arxiv.org/pdf/2304.08485)
+- [DETR: End-to-End Object Detection with Transformers](https://arxiv.org/pdf/2005.12872)
+- [LISA: Reasoning Segmentation via Large Language Model](https://arxiv.org/pdf/2308.00692)
 
-Название «LIZA» — моя версия LISA: та же логика «специальный токен → эмбеддинг → spatial output», но вместо сегментационных масок пока bbox.
-
----
-
-
-## Используемые статьи
-
-| Статья | Что взял оттуда 
-|--------|-----------------|
-| [LLaVA: Visual Instruction Tuning](https://arxiv.org/pdf/2304.08485) (Liu et al., 2023) | CLIP + LLM + обучаемый MLP-проектор, `<img>` токен, instruction tuning на caption-данных |
-| [DETR: End-to-End Object Detection with Transformers](https://arxiv.org/pdf/2005.12872) (Carion et al., 2020) | L1 + GIoU loss для bbox, идея «предсказываем box напрямую из hidden state» |
-| [LISA: Reasoning Segmentation via LLM](https://arxiv.org/pdf/2308.00692) (Lai et al., 2023) | Спецтокен (`<loc>` вместо `<SEG>`), embedding-as-output, LoRA на LLM | 
+**Задача:** Собрать мультимодальную модель с нуля, которая умеет **описывать изображения** и **находить объекты по текстовому запросу** (grounding через bbox). Без готовых LLaVA-обёрток — свой датасет, forward pass, training loop и inference.
 
 ---
 
-## Зачем это вообще
-
-Мне хотелось не просто вызвать `pipeline("image-to-text")`, а пройти весь путь руками:
-
-- как собрать мультимодальный батч с `<img>` токеном;
-- как правильно замаскировать лосс, чтобы модель училась только на ответе ассистента;
-- как вставить визуальные эмбеддинги внутрь LLM вместо одного placeholder-токена;
-- как добавить вторую «голову» — не текст, а координаты.
-
-В итоге получился двухэтапный пайплайн: сначала учим «склейку» vision + language (LLaVA), потом докручиваем grounding (LIZA).
-
----
-
-## Как это устроено
+## **1. Архитектура**
 
 ```
-Картинка ──► CLIP ViT ──► patch features (penultimate layer)
-                              │
-                              ▼
-                         MLP Projector (+ pixel unshuffle)
-                              │
-Текст ──► Tokenizer ──► embeddings ──► замена <img> на visual tokens ──► Qwen2.5-0.5B
-                              │
-                              ▼
-                    генерация текста / <loc> токен
-                              │
-                              ▼
-                    DetectionHead ──► bbox [x1, y1, x2, y2]
+Картинка → CLIP ViT → patch features (penultimate layer)
+                           ↓
+                      MLP Projector (+ pixel unshuffle)
+                           ↓
+Текст → Tokenizer → embeddings → замена <img> на visual tokens → Qwen2.5-0.5B
+                           ↓
+                 генерация текста / <loc> токен
+                           ↓
+                 DetectionHead → bbox [x1, y1, x2, y2]
 ```
 
 **Заморожено:** CLIP ViT (`openai/clip-vit-base-patch16`)
 
 **Учится:**
-- на этапе 1 — только MLP-проектор;
-- на этапе 2 — MLP + DetectionHead + LoRA-адаптеры на Qwen.
+- Этап 1 — только MLP-проектор
+- Этап 2 — MLP + DetectionHead + LoRA на Qwen
 
-**Спецтокены:** `<img>` (вставка картинки), `<loc>` (маркер «здесь должен быть bbox»)
-
----
-
-## Структура репозитория
-
-```
-Mini-LLaVA-from-scratch/
-├── LLaVA_adapter_train.ipynb    # Этап 1: обучение MLP на COCO captions
-├── LLaVA_inference.ipynb        # Инференс captioning + сравнение с baseline
-├── LIZA_grounding_train.ipynb   # Этап 2: grounding + LoRA + detection head
-├── LIZA_inference.ipynb         # Инференс: describe / locate / joint
-├── models/model0/checkpoints/    # Сохранённые веса
-│   ├── adapter_epoch_*.pth
-│   ├── head_module_epoch_*.pth
-│   ├── llm_module_epoch_*/       # LoRA weights (PEFT)
-│   ├── loss_log.txt
-│   └── training_loss.png
-└── samples/                      # сюда кладём скрины примеров (см. ниже)
-```
+**Спецтокены:** `<img>` (вставка картинки), `<loc>` (маркер «здесь bbox»)
 
 ---
 
-## Этап 1: LLaVA adapter
+## **2. Описание решения**
 
-**Ноутбук:** `LLaVA_adapter_train.ipynb`
+Проект разбит на два этапа — сначала учим «склейку» vision + language, потом добавляем spatial grounding.
 
-Берём mini COCO 2014 (captions), строим простой датасет:
+### **Этап 1: LLaVA adapter** (`LLaVA_adapter_train.ipynb`)
 
-```
-<|im_start|>user
-<img>
-Describe this image.
-<|im_start|>assistant
-{caption}
-```
+- Берём mini COCO 2014 captions
+- Строим промпт: `<img>` + `Describe this image.` → ответ ассистента
+- Лосс считается **только** по токенам ответа (`labels[:len(prompt)] = -100`)
+- MLP с `pixel_unshuffle` — сжимаем число visual tokens в 4 раза перед проекцией
 
-Лосс считается **только** по токенам ответа ассистента — всё до этого замаскировано `-100`.
+### **Этап 2: LIZA grounding** (`LIZA_grounding_train.ipynb`)
 
-MLP-проектор с `pixel_unshuffle`: сжимаем число визуальных токенов в 4 раза перед проекцией в text space. Это уменьшает длину последовательности и экономит память.
+Название LIZA — моя версия LISA: та же идея «спецтокен → hidden state → spatial output», но вместо segmentation mask пока bbox.
 
-| Параметр | Значение |
-|----------|----------|
-| Vision | CLIP ViT-B/16 |
-| LLM | Qwen2.5-0.5B-Instruct (frozen) |
-| Dataset | mini COCO 2014 captions |
-| Epochs | 6 |
-| Batch size | 16 × grad accum 2 |
-| LR | 1e-3 (AdamW) |
-| Precision | fp16 |
-
-Чекпоинты: `checkpoints/llava_mlp_epoch_{k}.pth`
-
----
-
-## Этап 2: LIZA grounding
-
-**Ноутбук:** `LIZA_grounding_train.ipynb`
-
-Здесь датасет сложнее — из COCO 2017 собираются 4 типа сэмплов:
+Из COCO 2017 собираем 4 типа сэмплов:
 
 | task_type | Что делает модель |
 |-----------|-------------------|
 | `caption` | Описывает картинку |
 | `grounding` | «Locate the {object}» → `<loc>` + bbox |
-| `joint` | Два turn'а подряд: caption, потом grounding |
+| `joint` | Caption, потом grounding в одном диалоге |
 | `locate_and_describe` | Описание + локализация в одном ответе |
 
-Bbox нормализуются в `[0, 1]`. Для сэмплов без bbox ставится `[-1, -1, -1, -1]` и detection loss не считается.
-
-Detection loss — не просто MSE, а **L1 + GIoU** (из DETR):
+- Модель генерирует `<loc>`, эмбеддинг этого токена идёт в `DetectionHead` → bbox
+- Detection loss из DETR: **L1 + GIoU** (не просто MSE)
+- LoRA (r=16) на attention/MLP слоях Qwen + обучение `embed_tokens` / `lm_head` под новые токены
 
 ```python
 detection_loss = 2.0 * L1 + 5.0 * GIoU
 total_loss = text_loss + detection_loss
 ```
 
-LoRA (r=16, alpha=32) вешается на attention и MLP слои Qwen. Отдельно учатся `embed_tokens` и `lm_head`, потому что добавили новые токены.
+### **Структура репозитория**
 
-| Параметр | Значение |
-|----------|----------|
-| Dataset | COCO 2017 (captions + instances) |
-| Epochs | 1 (пока; планирую больше) |
-| Batch size | 8 × grad accum 2 |
-| LR | 1e-3 (MLP + head), 1e-4 (LoRA) |
-| Detection loss | L1 + GIoU |
-
----
-
-## Запуск
-
-### Зависимости
-
-```bash
-pip install torch torchvision transformers peft pillow tqdm matplotlib
 ```
-
-Нужна GPU. На CPU можно только инференс маленьких моделей, обучение — боль.
-
-### Обучение
-
-1. Положить датасет (пути в ноутбуках заточены под Kaggle, поменять на свои):
-   - mini COCO 2014 → для adapter train
-   - COCO 2017 → для grounding train
-2. Запустить `LLaVA_adapter_train.ipynb` → получить MLP checkpoint
-3. Запустить `LIZA_grounding_train.ipynb` → получить adapter + head + LoRA
-
-### Инференс
-
-```python
-# LLaVA — captioning
-# см. LLaVA_inference.ipynb
-
-# LIZA — caption + grounding
-model = LIZA(
-    vision_model="openai/clip-vit-base-patch16",
-    llm_name="Qwen/Qwen2.5-0.5B-Instruct",
-    lora_checkpoint="models/model0/checkpoints/llm_module_epoch_1",
-    mlp_checkpoint="models/model0/checkpoints/adapter_epoch_1.pth",
-    detection_head_checkpoint="models/model0/checkpoints/head_module_epoch_1.pth",
-)
-
-res = model.generate(image, "Locate the train.")
-# res["text"] — ответ модели
-# res["bbox"]  — [x0, y0, x1, y1] в пикселях (или None)
+Mini-LLaVA-from-scratch/
+├── LLaVA_adapter_train.ipynb    # Этап 1: MLP на COCO captions
+├── LLaVA_inference.ipynb        # Captioning + сравнение с baseline
+├── LIZA_grounding_train.ipynb   # Этап 2: grounding + LoRA + detection head
+├── LIZA_inference.ipynb         # Describe / locate / joint
+└── models/model0/checkpoints/   # Веса (adapter, head, LoRA, loss log)
 ```
 
 ---
 
-## Примеры работы
-![alt text](image.png)
-![alt text](image-2.png)
+## **3. Эксперименты**
 
-![alt text](image-3.png)
-![alt text](image-4.png)
-### Captioning (LLaVA)
+### **Этап 1 — LLaVA adapter**
 
-**Запрос:** `Describe this image.`
+**Гиперпараметры**
+- **Vision encoder:** CLIP ViT-B/16
+- **LLM:** Qwen2.5-0.5B-Instruct (frozen)
+- **Dataset:** mini COCO 2014 captions
+- **Epochs:** 6
+- **Batch size:** 16 × grad accum 2
+- **Learning rate:** 1e-3 (AdamW, weight_decay=0.1)
+- **Precision:** fp16
 
-<!-- TODO: добавить скрин -->
-![Caption example](samples/caption_example.png)
-*Placeholder — сюда скрин из LLaVA_inference.ipynb*
+### **Этап 2 — LIZA grounding**
 
-| | До обучения MLP | После обучения | Qwen2-VL-2B (baseline) |
-|---|---|---|---|
-| Ответ | *(вставить)* | *(вставить)* | *(вставить)* |
-
----
-
-### Grounding (LIZA)
-
-**Запрос:** `Locate the train.`
-
-<!-- TODO: добавить скрин -->
-![Grounding example](image-7.png)
-
-**Запрос:** `Describe this image and locate the train.`
-
-![Joint task example](image-6.png)
-*Placeholder — caption + bbox на одном изображении*
+**Гиперпараметры**
+- **Dataset:** COCO 2017 (captions + instances)
+- **Epochs:** 1
+- **Batch size:** 8 × grad accum 2
+- **Learning rate:** 1e-3 (MLP + head), 1e-4 (LoRA)
+- **LoRA:** r=16, alpha=32, dropout=0.05
+- **Detection loss:** L1 (×2.0) + GIoU (×5.0)
 
 ---
 
-### Сравнение до / после grounding-обучения
+## **4. Результаты**
 
-![Before/after grounding](samples/before_after_grounding.png)
-*Placeholder — один и тот же промпт, два результата*
+**Качественные примеры**
 
----
+- **Успехи:**
+  - После обучения MLP captioning заметно лучше, чем с untrained projector
+  - Модель генерирует `<loc>` и выдаёт bbox — pipeline работает end-to-end
+  - Joint-задача (описать + найти объект) тоже отрабатывает
 
-### Кривая обучения
+  - Captioning
+    - <img alt="caption example" src="image.png" />
 
-![Training loss](models/model0/checkpoints/training_loss.png)
+  - Grounding — Locate the train
+    - <img alt="grounding example" src="image-7.png" />
 
----
+  - Joint — Describe + locate
+    - <img  alt="joint task" src="image-6.png" />
 
-## Что получилось
-- end-to-end пайплайн от датасета до инференса;
-- корректное маскирование лосса и вставка visual tokens;
-- captioning после обучения adapter'а (качественно лучше untrained MLP);
-- grounding pipeline: модель генерирует `<loc>`, head выдаёт bbox;
-- LoRA + multi-task обучение (caption + grounding + joint).
----
+  - Другие примеры
+    - <img alt="example 2" src="image-2.png" />
+    - <img alt="example 3" src="image-3.png" />
+    - <img alt="example 4" src="image-4.png" />
 
-## Стек
+**Кривая обучения**
 
-- Python 3.10+
-- PyTorch
-- HuggingFace Transformers + PEFT (LoRA)
-- CLIP ViT, Qwen2.5-0.5B-Instruct
-- COCO 2014 / 2017
-- Jupyter Notebooks (основной формат проекта)
+- <img alt="training loss" src="models/model0/checkpoints/training_loss.png" />
 
----
-
-## Ссылки
-
-- [LLaVA — Visual Instruction Tuning](https://arxiv.org/pdf/2304.08485)
-- [DETR — End-to-End Object Detection with Transformers](https://arxiv.org/pdf/2005.12872)
-- [LISA — Reasoning Segmentation via Large Language Model](https://arxiv.org/pdf/2308.00692)
+Средний loss за 1 эпоху: **6.47** (`models/model0/checkpoints/loss_log.txt`)
 
 ---
+
+## **5. Выводы**
+
+**Что получилось:**
+✅ End-to-end пайплайн: датасет → обучение → инференс, всё на чистом PyTorch  
+✅ Корректное маскирование лосса и вставка visual tokens в LLM  
+✅ Captioning после adapter train — качественно лучше baseline без обучения  
+✅ Grounding через `<loc>` + DetectionHead — идея из LISA/DETR работает  
+✅ Multi-task обучение (caption + grounding + joint) в одном цикле  
+
+**Что не получилось:**
+❌ Качество bbox пока слабое — нужно больше эпох и, возможно, другие веса loss  
+❌ Нет reasoning segmentation как в оригинальной LISA  
+❌ Нет метрик на val и сравнения с SOTA grounding-моделями  
+
+**Почему?**
+- Мало эпох grounding-обучения (1 vs планируемых 6+)
+- Маленькая LLM (0.5B) — для сложных запросов не хватает capacity
+- Упрощённый detection head (MLP вместо полного DETR decoder)
+- Не пробовал ReasonSeg и сложные implicit queries из LISA
+<!-- 
+**Что дальше:**
+- Добавить метрики (IoU@mAP, CIDEr)
+- Больше эпох + подбор весов L1/GIoU
+- Gradio-демо для живого инференса
+- Попробовать segmentation head вместо bbox (ближе к оригинальной LISA) -->
