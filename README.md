@@ -122,18 +122,18 @@ Mini-LLaVA-from-scratch/
   - Joint-задача (описать + найти объект) тоже отрабатывает
 
   - Captioning
-    - <img alt="caption example" src="image.png" />
+    - <img alt="caption example" src="images/image.png" />
 
   - Grounding — Locate the train
-    - <img alt="grounding example" src="image-7.png" />
+    - <img alt="grounding example" src="images/image-7.png" />
 
   - Joint — Describe + locate
-    - <img  alt="joint task" src="image-6.png" />
+    - <img  alt="joint task" src="images/image-6.png" />
 
   - Другие примеры
-    - <img alt="example 2" src="image-2.png" />
-    - <img alt="example 3" src="image-3.png" />
-    - <img alt="example 4" src="image-4.png" />
+    - <img alt="example 2" src="images/image-2.png" />
+    - <img alt="example 3" src="images/image-3.png" />
+    - <img alt="example 4" src="images/image-4.png" />
 
 **Кривая обучения**
 
